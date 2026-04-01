@@ -1,6 +1,6 @@
 [project]
 name = "hermes-vcc"
-version = "0.1.0"
+version = "0.2.0"
 description = "Lossless conversation archiving and VCC-enhanced compression for Hermes agent"
 license = "Apache-2.0"
 requires-python = ">=3.11"

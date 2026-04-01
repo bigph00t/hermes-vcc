@@ -1,9 +1,6 @@
 """Configuration for hermes-vcc.
 
-Reads the ``compression.vcc`` section from Hermes's ``config.yaml`` and
-exposes it as a typed :class:`VCCConfig` dataclass.  Missing keys fall
-back to safe defaults so the module works out of the box without any
-configuration.
+Reads ``compression.vcc`` from Hermes config.yaml.
 """
 
 from __future__ import annotations
@@ -20,107 +17,55 @@ _DEFAULT_HERMES_CONFIG = Path.home() / ".hermes" / "config.yaml"
 
 @dataclass
 class VCCConfig:
-    """Typed VCC configuration with safe defaults."""
+    """VCC configuration with safe defaults."""
 
     enabled: bool = True
     archive_dir: Path = field(
         default_factory=lambda: Path.home() / ".hermes" / "vcc_archives"
     )
-    enhanced_summary: bool = True
-    recovery_tool: bool = True
     retain_archives: int = 10
-    # Summary mode: "pure" (no LLM, .min.txt only), "hybrid" (VCC + LLM),
-    # or "llm" (original LLM-only, VCC archives only).
-    summary_mode: str = "pure"
 
     def __post_init__(self) -> None:
-        # Coerce string paths (e.g. from YAML) to Path objects.
         if isinstance(self.archive_dir, str):
             self.archive_dir = Path(self.archive_dir)
-        if self.summary_mode not in ("pure", "hybrid", "llm"):
-            logger.warning(
-                "Invalid summary_mode %r, defaulting to 'pure'",
-                self.summary_mode,
-            )
-            self.summary_mode = "pure"
-
-
-def _parse_section(raw: dict[str, Any]) -> VCCConfig:
-    """Build a :class:`VCCConfig` from a raw dict, ignoring unknown keys."""
-    kwargs: dict[str, Any] = {}
-
-    if "enabled" in raw:
-        kwargs["enabled"] = bool(raw["enabled"])
-
-    if "archive_dir" in raw:
-        kwargs["archive_dir"] = Path(str(raw["archive_dir"]))
-
-    if "enhanced_summary" in raw:
-        kwargs["enhanced_summary"] = bool(raw["enhanced_summary"])
-
-    if "recovery_tool" in raw:
-        kwargs["recovery_tool"] = bool(raw["recovery_tool"])
-
-    if "retain_archives" in raw:
-        try:
-            kwargs["retain_archives"] = int(raw["retain_archives"])
-        except (TypeError, ValueError):
-            pass
-
-    if "summary_mode" in raw:
-        kwargs["summary_mode"] = str(raw["summary_mode"])
-
-    return VCCConfig(**kwargs)
 
 
 def load_config(config_path: Path | None = None) -> VCCConfig:
-    """Load VCC config from Hermes ``config.yaml`` under ``compression.vcc``.
+    """Load VCC config from Hermes config.yaml.
 
-    Falls back to defaults if the file is missing, unparseable, or the
-    ``compression.vcc`` section does not exist.
-
-    Args:
-        config_path: Explicit path to Hermes config.yaml.  When *None*,
-            uses ``~/.hermes/config.yaml``.
-
-    Returns:
-        A fully-populated :class:`VCCConfig` instance.
+    Falls back to defaults if anything is missing.
     """
     path = config_path or _DEFAULT_HERMES_CONFIG
 
     if not path.is_file():
-        logger.debug("Hermes config not found at %s — using VCC defaults", path)
         return VCCConfig()
 
     try:
-        import yaml  # type: ignore[import-untyped]
+        import yaml
     except ImportError:
-        logger.warning(
-            "PyYAML not installed — cannot read %s, using VCC defaults", path
-        )
         return VCCConfig()
 
     try:
-        text = path.read_text(encoding="utf-8")
-        data = yaml.safe_load(text)
-    except Exception as exc:
-        logger.warning("Failed to parse %s: %s — using VCC defaults", path, exc)
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
         return VCCConfig()
 
     if not isinstance(data, dict):
-        logger.debug("Hermes config at %s is not a mapping — using VCC defaults", path)
         return VCCConfig()
 
-    compression = data.get("compression")
-    if not isinstance(compression, dict):
-        logger.debug("No 'compression' section in %s — using VCC defaults", path)
-        return VCCConfig()
-
-    vcc_section = compression.get("vcc")
+    vcc_section = data.get("compression", {}).get("vcc", {})
     if not isinstance(vcc_section, dict):
-        logger.debug(
-            "No 'compression.vcc' section in %s — using VCC defaults", path
-        )
         return VCCConfig()
 
-    return _parse_section(vcc_section)
+    kwargs: dict[str, Any] = {}
+    if "enabled" in vcc_section:
+        kwargs["enabled"] = bool(vcc_section["enabled"])
+    if "archive_dir" in vcc_section:
+        kwargs["archive_dir"] = Path(str(vcc_section["archive_dir"]))
+    if "retain_archives" in vcc_section:
+        try:
+            kwargs["retain_archives"] = int(vcc_section["retain_archives"])
+        except (TypeError, ValueError):
+            pass
+
+    return VCCConfig(**kwargs)

@@ -1,3 +1,7 @@
-"""hermes-vcc: Lossless conversation archiving and VCC-enhanced compression for Hermes agent."""
+"""hermes-vcc: VCC integration for Hermes agent.
 
-__version__ = "0.1.0"
+Lossless conversation archiving + deterministic .min.txt compression
+summaries. No LLM calls. Based on the VCC paper by Lvmin Zhang (Stanford).
+"""
+
+__version__ = "0.2.0"

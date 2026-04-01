@@ -1,156 +1,87 @@
-"""Tests for hermes_vcc.hooks — integration hooks for monkey-patching agents."""
+"""Tests for hermes_vcc.hooks — VCC installation on agent instances."""
 
-from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
 from hermes_vcc.config import VCCConfig
-from hermes_vcc.hooks import (
-    install_all,
-    install_archive_hook,
-    install_recovery_tool,
-    VCC_RECOVERY_SCHEMA,
-)
+from hermes_vcc.hooks import install, _install_archive, _install_summary
 
 
 def _make_config(tmp_path):
-    """Create a VCCConfig pointing at tmp_path for archives."""
-    return VCCConfig(
-        enabled=True,
-        archive_dir=tmp_path / "vcc_archives",
-        enhanced_summary=True,
-        recovery_tool=True,
-        retain_archives=10,
-    )
+    return VCCConfig(enabled=True, archive_dir=tmp_path / "vcc_archives", retain_archives=10)
 
 
-def _make_agent(has_compress=True, has_tools=True):
-    """Create a mock agent with the attributes hooks expect."""
+def _make_agent(has_compress=True):
     agent = MagicMock()
-    agent.session_id = "test-session-123"
-
+    agent.session_id = "test-123"
     if has_compress:
-        agent._compress_context = MagicMock(return_value=([], "summary"))
-        agent._compress_context._vcc_archive_wrapped = False
+        agent._compress_context = MagicMock(return_value=([], "sys"))
+        agent._compress_context._vcc_wrapped = False
+        agent.context_compressor = MagicMock()
+        agent.context_compressor._generate_summary = MagicMock(return_value="llm summary")
+        agent.context_compressor._generate_summary._vcc_wrapped = False
     else:
-        # Simulate agent without _compress_context
         del agent._compress_context
-
-    if has_tools:
-        agent.tools = []
-        agent.valid_tool_names = frozenset()
-    else:
-        del agent.tools
-
+        del agent.context_compressor
     return agent
 
 
-class TestInstallArchiveHook:
-    """install_archive_hook wraps _compress_context."""
-
-    def test_install_archive_hook(self, tmp_path, vcc_py_path):
+class TestInstallArchive:
+    def test_installs(self, tmp_path, vcc_py_path):
         config = _make_config(tmp_path)
-        agent = _make_agent(has_compress=True)
-        original_method = agent._compress_context
+        agent = _make_agent()
+        original = agent._compress_context
+        assert _install_archive(agent, config) is True
+        assert agent._compress_context._vcc_wrapped is True
+        # Calling wrapper delegates to original
+        agent._compress_context([{"role": "user", "content": "hi"}], "sys")
+        original.assert_called_once()
 
-        result = install_archive_hook(agent, config)
-        assert result is True
-
-        # The method should be wrapped now
-        assert hasattr(agent._compress_context, "_vcc_archive_wrapped")
-        assert agent._compress_context._vcc_archive_wrapped is True
-
-        # Calling the wrapper should call the original method
-        messages = [{"role": "user", "content": "test"}]
-        agent._compress_context(messages, "system prompt")
-        original_method.assert_called_once_with(messages, "system prompt")
-
-    def test_install_archive_hook_no_method(self, tmp_path):
-        """Agent without _compress_context returns False."""
+    def test_no_method(self, tmp_path):
         config = _make_config(tmp_path)
         agent = _make_agent(has_compress=False)
+        assert _install_archive(agent, config) is False
 
-        result = install_archive_hook(agent, config)
-        assert result is False
-
-    def test_install_archive_hook_double_patch(self, tmp_path, vcc_py_path):
-        """Second call is idempotent."""
+    def test_idempotent(self, tmp_path, vcc_py_path):
         config = _make_config(tmp_path)
-        agent = _make_agent(has_compress=True)
-
-        first = install_archive_hook(agent, config)
-        assert first is True
-
-        # Capture the wrapper after first install
-        wrapper_after_first = agent._compress_context
-
-        second = install_archive_hook(agent, config)
-        assert second is True
-
-        # The wrapper should be the same object (not double-wrapped)
-        assert agent._compress_context is wrapper_after_first
+        agent = _make_agent()
+        _install_archive(agent, config)
+        wrapper = agent._compress_context
+        _install_archive(agent, config)
+        assert agent._compress_context is wrapper  # not double-wrapped
 
 
-class TestInstallRecoveryTool:
-    """install_recovery_tool adds schema to agent.tools."""
-
-    def test_install_recovery_tool(self, tmp_path):
+class TestInstallSummary:
+    def test_installs(self, tmp_path, vcc_py_path):
         config = _make_config(tmp_path)
-        agent = _make_agent(has_tools=True)
+        agent = _make_agent()
+        assert _install_summary(agent, config) is True
+        assert agent.context_compressor._generate_summary._vcc_wrapped is True
 
-        result = install_recovery_tool(agent, config)
-        assert result is True
-
-        # Tool schema should be in the tools list
-        assert len(agent.tools) == 1
-        assert agent.tools[0]["function"]["name"] == "vcc_recover"
-
-        # valid_tool_names should be updated
-        assert "vcc_recover" in agent.valid_tool_names
-
-        # Handler should be attached
-        assert hasattr(agent, "_vcc_recover_handler")
-        assert callable(agent._vcc_recover_handler)
-
-    def test_install_recovery_tool_no_tools_attr(self, tmp_path):
-        """Agent without tools attribute returns False."""
+    def test_no_compressor(self, tmp_path):
         config = _make_config(tmp_path)
-        agent = _make_agent(has_tools=False)
+        agent = _make_agent(has_compress=False)
+        assert _install_summary(agent, config) is False
 
-        result = install_recovery_tool(agent, config)
-        assert result is False
-
-    def test_install_recovery_tool_idempotent(self, tmp_path):
-        """Second install does not add duplicate schema."""
+    def test_idempotent(self, tmp_path, vcc_py_path):
         config = _make_config(tmp_path)
-        agent = _make_agent(has_tools=True)
+        agent = _make_agent()
+        _install_summary(agent, config)
+        fn = agent.context_compressor._generate_summary
+        _install_summary(agent, config)
+        assert agent.context_compressor._generate_summary is fn
 
-        install_recovery_tool(agent, config)
-        install_recovery_tool(agent, config)
 
-        assert len(agent.tools) == 1
-
-
-class TestInstallAll:
-    """install_all installs both hooks and reports results."""
-
-    def test_install_all(self, tmp_path, vcc_py_path):
+class TestInstall:
+    def test_both_hooks(self, tmp_path, vcc_py_path):
         config = _make_config(tmp_path)
-        agent = _make_agent(has_compress=True, has_tools=True)
+        agent = _make_agent()
+        results = install(agent, config)
+        assert results["archive"] is True
+        assert results["summary"] is True
 
-        results = install_all(agent, config=config)
-
-        assert results["archive_hook"] is True
-        assert results["recovery_tool"] is True
-
-    def test_install_all_disabled(self, tmp_path):
-        """When VCC is disabled, both hooks report False."""
+    def test_disabled(self, tmp_path):
         config = _make_config(tmp_path)
         config.enabled = False
         agent = _make_agent()
-
-        results = install_all(agent, config=config)
-
-        assert results["archive_hook"] is False
-        assert results["recovery_tool"] is False
+        results = install(agent, config)
+        assert results == {"archive": False, "summary": False}
