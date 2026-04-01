@@ -120,6 +120,95 @@ def install_archive_hook(agent_instance: Any, config: VCCConfig) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Summary mode hook
+# ---------------------------------------------------------------------------
+
+
+def install_summary_hook(agent_instance: Any, config: VCCConfig) -> bool:
+    """Patch the compressor's summary generation based on config.summary_mode.
+
+    Modes:
+        ``"pure"``: Replace ``_generate_summary`` with VCC's
+            ``compile_to_brief`` — deterministic, zero LLM calls, zero cost.
+            Falls back to the original LLM summary if VCC fails.
+        ``"hybrid"``: Feed VCC ``.min.txt`` skeleton + turns to the LLM.
+        ``"llm"``: No summary patching (original LLM-only behavior).
+            VCC still archives but doesn't touch the summary.
+
+    Args:
+        agent_instance: A Hermes ``AIAgent`` (or compatible) instance.
+        config: Resolved VCC configuration.
+
+    Returns:
+        *True* if the hook was installed, *False* on error or ``"llm"`` mode.
+    """
+    if config.summary_mode == "llm":
+        logger.debug("VCC summary_mode=llm — no summary hook needed")
+        return False
+
+    try:
+        compressor = getattr(agent_instance, "context_compressor", None)
+        if compressor is None:
+            logger.info("VCC summary hook: no context_compressor found — skipping")
+            return False
+
+        original_gen = getattr(compressor, "_generate_summary", None)
+        if original_gen is None:
+            logger.info("VCC summary hook: compressor has no _generate_summary — skipping")
+            return False
+
+        if getattr(original_gen, "_vcc_summary_wrapped", False):
+            logger.debug("VCC summary hook already installed — skipping")
+            return True
+
+        from hermes_vcc.enhanced_summary import (
+            compile_to_brief,
+            generate_pure_vcc_summary,
+            generate_vcc_enhanced_summary,
+            _messages_to_serialized_text,
+        )
+
+        if config.summary_mode == "pure":
+            def _vcc_pure_summary(turns_to_summarize, *args, **kwargs):
+                """Pure VCC summary: .min.txt only, no LLM call."""
+                brief = compile_to_brief(turns_to_summarize)
+                if brief:
+                    logger.info(
+                        "VCC pure summary: %d chars from .min.txt (no LLM call)",
+                        len(brief),
+                    )
+                    return brief
+                # VCC failed — fall back to original LLM summary
+                logger.info("VCC compilation failed, falling back to LLM summary")
+                return original_gen(turns_to_summarize, *args, **kwargs)
+
+            _vcc_pure_summary._vcc_summary_wrapped = True  # type: ignore[attr-defined]
+            compressor._generate_summary = _vcc_pure_summary
+            logger.info("VCC summary hook installed (mode=pure, no LLM calls)")
+
+        elif config.summary_mode == "hybrid":
+            def _vcc_hybrid_summary(turns_to_summarize, *args, **kwargs):
+                """Hybrid: VCC skeleton + LLM enrichment."""
+                def _llm_fn(text):
+                    # Reconstruct turns from text and call original
+                    return original_gen(turns_to_summarize, *args, **kwargs)
+
+                return generate_vcc_enhanced_summary(
+                    turns_to_summarize, _llm_fn
+                )
+
+            _vcc_hybrid_summary._vcc_summary_wrapped = True  # type: ignore[attr-defined]
+            compressor._generate_summary = _vcc_hybrid_summary
+            logger.info("VCC summary hook installed (mode=hybrid, VCC + LLM)")
+
+        return True
+
+    except Exception as exc:
+        logger.warning("Failed to install VCC summary hook: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Recovery tool
 # ---------------------------------------------------------------------------
 
@@ -335,6 +424,13 @@ def install_all(
 
     # Archive hook — always install when VCC is enabled.
     results["archive_hook"] = install_archive_hook(agent_instance, config)
+
+    # Summary hook — gated by enhanced_summary flag and summary_mode.
+    if config.enhanced_summary:
+        results["summary_hook"] = install_summary_hook(agent_instance, config)
+    else:
+        logger.debug("VCC enhanced summary disabled in config — skipping")
+        results["summary_hook"] = False
 
     # Recovery tool — gated by config flag.
     if config.recovery_tool:

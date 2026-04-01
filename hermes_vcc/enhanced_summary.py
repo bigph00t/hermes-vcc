@@ -1,9 +1,19 @@
-"""VCC-enhanced compressor: uses ``.min.txt`` as structural backbone for LLM summaries.
+"""VCC-enhanced compression summaries.
+
+Two modes of operation:
+
+**Pure VCC (no LLM)** — ``compile_to_brief()`` returns VCC's ``.min.txt``
+directly as the compression summary.  This is deterministic, zero-cost,
+zero-hallucination, and is what the VCC paper actually benchmarked (+1-4pp
+on AppWorld, 60% fewer tokens).  This is the recommended default.
+
+**Hybrid (VCC + LLM)** — ``generate_vcc_enhanced_summary()`` feeds the
+``.min.txt`` skeleton to an LLM for semantic enrichment.  More expensive
+but adds "why" context.  Use when the pure structural outline isn't enough.
 
 This module is intentionally decoupled from hermes-agent.  It provides
-wrapper functions that can augment *any* summary generation callable with
-VCC structural context, making the integration non-invasive and testable
-in isolation.
+wrapper functions that work with *any* summary generation callable,
+making the integration non-invasive and testable in isolation.
 
 All public functions swallow exceptions internally and fall back to the
 original summary path so the compression pipeline is never broken by VCC
@@ -137,6 +147,45 @@ def compile_to_brief(messages: list[dict[str, Any]]) -> str | None:
     except Exception as exc:
         logger.warning("compile_to_brief failed: %s", exc)
         return None
+
+
+def generate_pure_vcc_summary(
+    messages_to_summarize: list[dict[str, Any]],
+    fallback_summary_fn: Callable[[str], str] | None = None,
+) -> str | None:
+    """Generate a compression summary using pure VCC — no LLM call.
+
+    Returns VCC's ``.min.txt`` directly as the summary.  This is
+    deterministic, instant, and free.  The ``.min.txt`` captures every
+    tool call (collapsed to one-line summaries with line-range pointers),
+    user/assistant text (truncated), and conversation structure.
+
+    This is the recommended mode.  The VCC paper showed this alone
+    outperforms raw-transcript LLM summaries on AppWorld benchmarks.
+
+    Args:
+        messages_to_summarize: Hermes OpenAI-format messages to compress.
+        fallback_summary_fn: Optional callable for when VCC fails.
+            If None and VCC fails, returns None (caller should abort
+            compression rather than lose data).
+
+    Returns:
+        The summary string, or None if VCC fails and no fallback given.
+    """
+    brief = compile_to_brief(messages_to_summarize)
+    if brief:
+        return brief
+
+    # VCC failed — use fallback if provided
+    if fallback_summary_fn is not None:
+        logger.info("VCC compilation failed, falling back to LLM summary")
+        turns_text = _messages_to_serialized_text(messages_to_summarize)
+        try:
+            return fallback_summary_fn(turns_text)
+        except Exception as exc:
+            logger.warning("Fallback summary_fn also failed: %s", exc)
+
+    return None
 
 
 def generate_vcc_enhanced_summary(

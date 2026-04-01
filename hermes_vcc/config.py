@@ -29,11 +29,20 @@ class VCCConfig:
     enhanced_summary: bool = True
     recovery_tool: bool = True
     retain_archives: int = 10
+    # Summary mode: "pure" (no LLM, .min.txt only), "hybrid" (VCC + LLM),
+    # or "llm" (original LLM-only, VCC archives only).
+    summary_mode: str = "pure"
 
     def __post_init__(self) -> None:
         # Coerce string paths (e.g. from YAML) to Path objects.
         if isinstance(self.archive_dir, str):
             self.archive_dir = Path(self.archive_dir)
+        if self.summary_mode not in ("pure", "hybrid", "llm"):
+            logger.warning(
+                "Invalid summary_mode %r, defaulting to 'pure'",
+                self.summary_mode,
+            )
+            self.summary_mode = "pure"
 
 
 def _parse_section(raw: dict[str, Any]) -> VCCConfig:
@@ -57,6 +66,9 @@ def _parse_section(raw: dict[str, Any]) -> VCCConfig:
             kwargs["retain_archives"] = int(raw["retain_archives"])
         except (TypeError, ValueError):
             pass
+
+    if "summary_mode" in raw:
+        kwargs["summary_mode"] = str(raw["summary_mode"])
 
     return VCCConfig(**kwargs)
 
