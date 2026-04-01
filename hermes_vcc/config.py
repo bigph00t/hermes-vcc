@@ -28,6 +28,7 @@ class VCCConfig:
     def __post_init__(self) -> None:
         if isinstance(self.archive_dir, str):
             self.archive_dir = Path(self.archive_dir)
+        self.archive_dir = self.archive_dir.expanduser()
 
 
 def load_config(config_path: Path | None = None) -> VCCConfig:

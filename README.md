@@ -1,37 +1,71 @@
 # hermes-vcc
 
-**Lossless conversation archiving and VCC-enhanced compression for AI agents.**
+**Lossless conversation archiving with deterministic VCC compression summaries for AI agents.**
 
-<!-- Badges (uncomment when published / CI is wired) -->
-<!-- ![PyPI](https://img.shields.io/pypi/v/hermes-vcc) -->
-<!-- ![Python](https://img.shields.io/pypi/pyversions/hermes-vcc) -->
-<!-- ![License](https://img.shields.io/github/license/nousresearch/hermes-vcc) -->
-<!-- ![Tests](https://img.shields.io/github/actions/workflow/status/nousresearch/hermes-vcc/tests.yml?label=tests) -->
+Version 0.2.0
 
 ---
 
 ## Motivation
 
-Every long-running AI agent session faces the same problem: **context windows are finite**. When the conversation grows too large, the agent must compress it — summarizing older turns to free token budget. This works, but it is fundamentally lossy. Tool outputs, exact error messages, reasoning chains, multi-step debugging sessions — all reduced to a paragraph.
+Long-running AI agent sessions hit context window limits. The standard fix is LLM-generated summaries that discard tool outputs, error messages, and reasoning chains. This is lossy and expensive.
 
-**hermes-vcc** solves this by adding a lossless archival layer that runs *before* each compression cycle:
+**hermes-vcc** takes a different approach based on the VCC paper: the summary *is* the `.min.txt` compiled by VCC. No LLM call. Deterministic, instant, free. The full conversation is archived to disk so the agent can recover any detail by reading files directly.
 
-1. The full conversation is converted to a structured format and archived to disk.
-2. The VCC (Virtual Context Compiler) produces human-readable and machine-searchable views of the archive.
-3. A recovery tool lets the agent query these archives *after* compression, retrieving exact details on demand.
+VCC's `.min.txt` outperforms LLM-generated summaries on AppWorld benchmarks (+1-4 percentage points accuracy, ~60% fewer tokens).
 
-The result: aggressive compression thresholds become safe because nothing is truly lost. The agent can compress early and often, keeping its active context lean, while retaining the ability to recover any detail from any point in the session.
+## How It Works
 
-## Key Concepts
+1. Before each compression, the full conversation is archived as JSONL and compiled to VCC views (`.txt`, `.min.txt`).
+2. The `.min.txt` replaces the LLM summary. No API call, no cost, no latency.
+3. When the agent needs compressed-out details, it reads the archive files directly or runs `VCC.py --grep`.
 
-| Concept | Module | Purpose |
-|---------|--------|---------|
-| **Adapter** | `hermes_vcc.adapter` | Converts OpenAI chat-format messages to VCC-compatible Anthropic JSONL records |
-| **Archive** | `hermes_vcc.archive` | Writes timestamped JSONL snapshots and compiles VCC views before each compression |
-| **Recovery Tool** | `hermes_vcc.recovery` | Agent-facing tool (`vcc_recover`) for querying archives post-compression |
-| **Enhanced Summary** | `hermes_vcc.enhanced_summary` | Uses VCC `.min.txt` as a structural skeleton to improve LLM-generated summaries |
-| **Hooks** | `hermes_vcc.hooks` | Non-invasive monkey-patching to install archiving and recovery on a running agent |
-| **Config** | `hermes_vcc.config` | Reads `compression.vcc` from Hermes `config.yaml` with safe defaults |
+```
+Agent Session
+     |
+[context pressure]
+     |
+     v
++------------------+     +-------------------+
+| ARCHIVE          |     | SUMMARY           |
+|                  |     |                   |
+| messages -> JSONL |     | messages -> VCC   |
+| VCC compile:     |     | .min.txt IS the   |
+|   .txt (full)    |     | compression       |
+|   .min.txt (brief)|    | summary           |
++------------------+     +-------------------+
+     |
+     v
+vcc_archives/
+  session_abc/
+    cycle_1.jsonl        # lossless record
+    cycle_1.txt          # full readable view
+    cycle_1.min.txt      # structural brief
+    cycle_2.jsonl
+    cycle_2.txt
+    cycle_2.min.txt
+    manifest.json
+```
+
+## Recovery
+
+There is no special recovery tool. The agent recovers details the same way it reads any file:
+
+- **List archives:** Read `manifest.json` or use `list_archives()` to find what cycles exist.
+- **Read summaries:** Open `cycle_N.min.txt` for structural overview, `cycle_N.txt` for full detail.
+- **Search:** Run `python vendor/VCC.py --grep "pattern" cycle_N.txt` for regex search across archives.
+
+## Modules
+
+| Module | Purpose |
+|--------|---------|
+| `adapter.py` | Convert OpenAI chat-format messages to VCC-compatible Anthropic JSONL |
+| `archive.py` | Write timestamped JSONL snapshots and compile VCC views per compression cycle |
+| `enhanced_summary.py` | `compile_to_brief(messages)` — compile messages to `.min.txt` content directly |
+| `hooks.py` | `install(agent)` — patch archive + summary hooks onto a running Hermes agent |
+| `config.py` | Load `compression.vcc` from Hermes `config.yaml` with safe defaults |
+| `utils.py` | VCC import helper, token estimation, directory utilities |
+| `recovery.py` | `list_archives(archive_dir)` — find and list available archive cycles |
 
 ## Quick Start
 
@@ -43,141 +77,39 @@ pip install hermes-vcc
 pip install -e /path/to/hermes-vcc
 ```
 
-### Configure (for Hermes agent integration)
+### Configure
 
-Add to your `~/.hermes/config.yaml`:
+Add to `~/.hermes/config.yaml`:
 
 ```yaml
 compression:
   vcc:
     enabled: true
     archive_dir: ~/.hermes/vcc_archives
-    enhanced_summary: true
-    recovery_tool: true
     retain_archives: 10
 ```
 
-### Automatic Operation
-
-When integrated with Hermes, VCC hooks install automatically. Every time the agent compresses context:
-
-1. The full conversation is archived as JSONL + compiled VCC views.
-2. The compression summary is enriched with VCC structural context.
-3. The agent gains a `vcc_recover` tool to query archived details.
-
-No code changes to the agent are required.
-
-## How It Works
-
-```
-                         Hermes Agent
-                              |
-                     [context too large]
-                              |
-                              v
-                +--------------------------+
-                |   _compress_context()    |
-                |   (monkey-patched by     |
-                |    hermes-vcc hooks)     |
-                +--------------------------+
-                              |
-              +---------------+---------------+
-              |                               |
-              v                               v
-  +---------------------+        +----------------------+
-  |   ARCHIVE PHASE     |        |   COMPRESS PHASE     |
-  |                     |        |   (original method)   |
-  |  1. adapter.py      |        |                      |
-  |     OpenAI -> JSONL  |        |  LLM summarizes the  |
-  |                     |        |  conversation with    |
-  |  2. archive.py      |        |  VCC .min.txt as     |
-  |     Write JSONL to   |        |  structural backbone  |
-  |     disk per cycle  |        |                      |
-  |                     |        +----------------------+
-  |  3. VCC compile     |                    |
-  |     .jsonl -> .txt   |                    v
-  |     .jsonl -> .min   |        +----------------------+
-  |                     |        |  Compressed context   |
-  |  4. manifest.json   |        |  returned to agent    |
-  |     Update metadata |        +----------------------+
-  +---------------------+
-              |
-              v
-  +---------------------+
-  |   ON-DISK ARCHIVE   |
-  |                     |
-  |   vcc_archives/     |
-  |   +-- session_abc/  |
-  |       +-- cycle_1.jsonl
-  |       +-- cycle_1.txt
-  |       +-- cycle_1.min.txt
-  |       +-- cycle_2.jsonl
-  |       +-- cycle_2.txt
-  |       +-- cycle_2.min.txt
-  |       +-- manifest.json
-  +---------------------+
-              ^
-              |
-  +---------------------+
-  |   RECOVERY TOOL     |
-  |   vcc_recover       |
-  |                     |
-  |   list   -> cycles  |
-  |   overview -> .min  |
-  |   search -> regex   |
-  |   read   -> lines   |
-  +---------------------+
-```
-
-## Recovery Tool
-
-After compression, the agent can invoke `vcc_recover` to retrieve lost details. Here is an example interaction:
-
-```
-Agent: I need to check what error occurred in the database migration earlier,
-       but that was compressed out of context.
-
-Agent calls: vcc_recover(action="list")
-  -> VCC Archives (3 cycles):
-       cycle_1: 2026-03-31T10:00:00Z (45 messages, ~12,400 tokens)
-       cycle_2: 2026-03-31T11:30:00Z (62 messages, ~18,200 tokens)
-       cycle_3: 2026-03-31T13:15:00Z (38 messages, ~9,800 tokens)
-
-Agent calls: vcc_recover(action="search", query="migration.*error")
-  -> Search: /migration.*error/ in cycle_3 (2 matches in 284 lines)
-     ---
-        102: [tool_result] Running database migration...
-     >> 103: Error: relation "users_v2" already exists
-        104: Migration failed with exit code 1
-     ---
-     >> 198: Fixed migration error by adding IF NOT EXISTS clause
-        199: Re-running migration...
-        200: Migration completed successfully
-
-Agent calls: vcc_recover(action="read", query="100-110")
-  -> === cycle_3 lines 100-110 (of 284) ===
-       100: [assistant] Let me run the migration script.
-       101: [tool_use] terminal(command="python manage.py migrate")
-       102: [tool_result] Running database migration...
-       103: Error: relation "users_v2" already exists
-       ...
-```
-
-## Configuration Reference
-
-All settings live under `compression.vcc` in `~/.hermes/config.yaml`:
-
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `true` | Master switch for all VCC functionality |
-| `archive_dir` | path | `~/.hermes/vcc_archives` | Root directory for session archive storage |
-| `enhanced_summary` | bool | `true` | Use VCC `.min.txt` to enrich LLM compression summaries |
-| `recovery_tool` | bool | `true` | Register `vcc_recover` tool on the agent |
-| `retain_archives` | int | `10` | Maximum archive cycles to keep per session (oldest pruned) |
+| `enabled` | bool | `true` | Master switch for VCC |
+| `archive_dir` | path | `~/.hermes/vcc_archives` | Root directory for archives |
+| `retain_archives` | int | `10` | Max archive cycles per session (oldest pruned) |
+
+### Automatic Operation (Hermes)
+
+```python
+from hermes_vcc.hooks import install
+install(agent)  # patches archive + summary hooks
+```
+
+After this call:
+- Every compression cycle archives the full conversation first.
+- The LLM summary is replaced with VCC `.min.txt` output.
+- Falls back to the original LLM summary if VCC compilation fails.
+
+No other code changes required.
 
 ## Standalone Usage
-
-hermes-vcc can be used outside of Hermes for any application that needs to convert OpenAI-format conversations to structured archives.
 
 ```python
 from hermes_vcc.adapter import convert_conversation, records_to_jsonl
@@ -188,15 +120,11 @@ messages = [
     {"role": "assistant", "content": "VCC is the Virtual Context Compiler..."},
 ]
 
-# Convert to VCC JSONL records
 records = convert_conversation(messages)
-
-# Serialize to JSONL string
 jsonl = records_to_jsonl(records)
-print(jsonl)
 ```
 
-For archival with VCC compilation:
+Archive with VCC compilation:
 
 ```python
 from pathlib import Path
@@ -211,79 +139,61 @@ session_dir = archive_before_compression(
 # Produces: ./archives/my-session/cycle_1.jsonl, .txt, .min.txt, manifest.json
 ```
 
-For post-hoc recovery:
+Compile to `.min.txt` directly:
 
 ```python
-from hermes_vcc.recovery import handle_vcc_recover
+from hermes_vcc.enhanced_summary import compile_to_brief
 
-# List available archives
-result = handle_vcc_recover(action="list", archive_dir=Path("./archives"))
-
-# Search for specific content
-result = handle_vcc_recover(
-    action="search",
-    query="database.*error",
-    archive_dir=Path("./archives"),
-)
+brief = compile_to_brief(messages)
+# Returns the .min.txt content as a string, or None on failure
 ```
 
-## Academic Context
+List archives:
 
-This project builds on the **Virtual Context Compiler (VCC)** by Lvmin Zhang et al. at Stanford University. VCC was introduced as a method to compile conversation transcripts into compressed, view-oriented representations that preserve structural information while reducing token count.
+```python
+from hermes_vcc.recovery import list_archives
 
-Key results from the VCC paper (evaluated on AppWorld benchmarks):
+print(list_archives(Path("./archives")))
+```
 
-- **+1 to +4 percentage points** improvement in task completion accuracy when using VCC-compiled context versus raw transcripts.
-- **~60% fewer tokens** consumed by VCC-compiled views compared to full conversation logs.
-- The `.min.txt` (brief mode) view provides a structural skeleton that captures tool call patterns, decision points, and error recovery flows in a fraction of the original size.
-
-hermes-vcc applies these findings to the practical problem of context compression in long-running agent sessions, using VCC as both an archival format and a compression enhancement.
-
-**Reference:** Lvmin Zhang, *Virtual Context Compiler*, Stanford University / ControlNet. [GitHub: lllyasviel/VCC](https://github.com/lllyasviel/VCC)
-
-## Architecture
+## Project Structure
 
 ```
 hermes_vcc/
-    __init__.py          # Package metadata and version
+    __init__.py          # Version (0.2.0)
     adapter.py           # OpenAI -> VCC JSONL format conversion
     archive.py           # Pre-compression archival pipeline
-    recovery.py          # Agent-facing recovery tool (vcc_recover)
-    enhanced_summary.py  # VCC-augmented compression summaries
-    hooks.py             # Non-invasive agent integration (monkey-patching)
-    config.py            # Configuration loading from Hermes config.yaml
-    utils.py             # Shared utilities (VCC import, token estimation, etc.)
+    enhanced_summary.py  # compile_to_brief() — messages to .min.txt
+    hooks.py             # install() — non-invasive agent integration
+    config.py            # Configuration from Hermes config.yaml
+    utils.py             # VCC import, token estimation, directory helpers
+    recovery.py          # list_archives() — find archived cycles
 
 vendor/
     VCC.py               # Vendored VCC compiler (upstream: lllyasviel/VCC)
 
 tests/
-    conftest.py          # Shared fixtures (sample messages, temp dirs)
-    test_adapter.py      # Format conversion tests
-    ...
-
-docs/
-    ARCHITECTURE.md      # System design and data flow
-    FORMAT_MAPPING.md    # Detailed OpenAI -> VCC field mapping
-    INTEGRATION.md       # Hermes integration guide
-
-examples/
-    basic_usage.py       # Standalone adapter + JSONL demo
-    manual_archive.py    # On-demand archival demo
-    recovery_demo.py     # Recovery tool demo
+    conftest.py          # Shared fixtures
+    test_adapter.py
+    test_archive.py
+    test_enhanced_summary.py
+    test_hooks.py
+    test_recovery.py
+    test_roundtrip.py
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed component diagrams and data flow.
+## Academic Context
+
+Based on the **Virtual Context Compiler (VCC)** by Lvmin Zhang et al. (Stanford University / ControlNet). VCC compiles conversation transcripts into compressed, view-oriented representations that preserve structural information while reducing token count.
+
+Key results from the VCC paper (AppWorld benchmarks):
+- **+1 to +4 pp** improvement in task completion accuracy vs. raw transcripts
+- **~60% fewer tokens** than full conversation logs
+- The `.min.txt` view captures tool call patterns, decision points, and error recovery flows
+
+**Reference:** Lvmin Zhang, *Virtual Context Compiler*, Stanford University / ControlNet. [GitHub: lllyasviel/VCC](https://github.com/lllyasviel/VCC)
 
 ## Contributing
-
-1. Fork the repository.
-2. Create a feature branch from `main`.
-3. Install dev dependencies: `pip install -e ".[dev]"`
-4. Run tests: `pytest`
-5. Submit a pull request with a clear description.
-
-### Development Setup
 
 ```bash
 git clone https://github.com/nousresearch/hermes-vcc.git
@@ -294,19 +204,16 @@ pip install -e ".[dev]"
 pytest
 ```
 
-### Code Standards
-
-- Python 3.11+ required.
-- Type hints on all public APIs.
-- All public functions must have docstrings.
-- Tests required for new functionality.
-- No exceptions may propagate from archive/hook code to the agent.
+- Python 3.11+
+- Type hints on all public APIs
+- Tests required for new functionality
+- No exceptions may propagate from archive/hook code to the agent
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) for full text.
+Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- **Lvmin Zhang** (Stanford / ControlNet) for the Virtual Context Compiler (VCC) and the research demonstrating its effectiveness on agent benchmarks.
-- **Nous Research** for the Hermes agent framework that this project integrates with.
+- **Lvmin Zhang** (Stanford / ControlNet) for the Virtual Context Compiler and the research demonstrating its effectiveness on agent benchmarks.
+- **Nous Research** for the Hermes agent framework.

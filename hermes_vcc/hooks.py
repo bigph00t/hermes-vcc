@@ -106,11 +106,22 @@ def _install_summary(agent: Any, config: VCCConfig) -> bool:
 
         from hermes_vcc.enhanced_summary import compile_to_brief
 
+        # Match the contract: _generate_summary must return text with
+        # SUMMARY_PREFIX, same as the original LLM path (context_compressor.py:446).
+        _PREFIX = (
+            "[CONTEXT COMPACTION] Earlier turns in this conversation were "
+            "compacted to save context space. The summary below describes "
+            "work that was already completed, and the current session state "
+            "may still reflect that work (for example, files may already be "
+            "changed). Use the summary and the current state to continue "
+            "from where things left off, and avoid repeating work:"
+        )
+
         def vcc_summary(turns, *args, **kwargs):
             brief = compile_to_brief(turns)
             if brief:
                 logger.info("VCC summary: %d chars (no LLM call)", len(brief))
-                return brief
+                return f"{_PREFIX}\n{brief}"
             logger.info("VCC failed, falling back to LLM summary")
             return original_gen(turns, *args, **kwargs)
 
