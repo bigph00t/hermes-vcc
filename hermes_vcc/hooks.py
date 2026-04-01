@@ -1,10 +1,16 @@
 """Install VCC into a running Hermes agent.
 
-Two hooks:
-1. Archive hook — before each compression, archive the full conversation
-   as JSONL and compile VCC views (.txt, .min.txt).
-2. Summary hook — replace the LLM summary with VCC's .min.txt.
-   Deterministic, instant, free. Falls back to LLM if VCC fails.
+One hook: archive the full conversation as VCC views (.txt, .min.txt)
+before each compression cycle. The LLM summary is left untouched —
+VCC is a projection tool for trace analysis and recovery, not a
+replacement for semantic compression summaries.
+
+Per the VCC paper (Zhang & Agrawala, 2026): VCC performs *projection*
+(selecting and annotating existing content with exact coordinates),
+not *abstraction* (generating new content). The LLM summary provides
+the semantic abstraction (Goal, Progress, Decisions, Next Steps) that
+the agent needs to continue working. VCC provides the lossless archive
+the agent can consult when it needs specific details.
 """
 
 from __future__ import annotations
@@ -21,14 +27,17 @@ _CYCLE_ATTR = "_vcc_compression_cycle"
 
 
 def install(agent: Any, config: VCCConfig | None = None) -> dict[str, bool]:
-    """Install VCC hooks on a Hermes agent.
+    """Install VCC archive hook on a Hermes agent.
+
+    Archives the full conversation as VCC views before each compression.
+    Does NOT replace the LLM summary — VCC is for recovery, not compression.
 
     Args:
         agent: A Hermes AIAgent instance.
         config: Optional config. Loaded from config.yaml if None.
 
     Returns:
-        {"archive": bool, "summary": bool} indicating success.
+        {"archive": bool} indicating success.
     """
     if config is None:
         try:
@@ -37,14 +46,11 @@ def install(agent: Any, config: VCCConfig | None = None) -> dict[str, bool]:
             config = VCCConfig()
 
     if not config.enabled:
-        return {"archive": False, "summary": False}
+        return {"archive": False}
 
-    results = {
-        "archive": _install_archive(agent, config),
-        "summary": _install_summary(agent, config),
-    }
-    logger.info("VCC hooks: %s", results)
-    return results
+    result = _install_archive(agent, config)
+    logger.info("VCC archive hook: %s", result)
+    return {"archive": result}
 
 
 def _install_archive(agent: Any, config: VCCConfig) -> bool:
@@ -84,51 +90,4 @@ def _install_archive(agent: Any, config: VCCConfig) -> bool:
 
     except Exception as exc:
         logger.warning("VCC archive hook failed: %s", exc)
-        return False
-
-
-def _install_summary(agent: Any, config: VCCConfig) -> bool:
-    """Replace compressor._generate_summary with VCC .min.txt.
-
-    The .min.txt is the summary. No LLM call.
-    Falls back to the original LLM summary if VCC compilation fails.
-    """
-    try:
-        compressor = getattr(agent, "context_compressor", None)
-        if compressor is None:
-            return False
-
-        original_gen = getattr(compressor, "_generate_summary", None)
-        if original_gen is None:
-            return False
-        if getattr(original_gen, "_vcc_wrapped", False):
-            return True
-
-        from hermes_vcc.enhanced_summary import compile_to_brief
-
-        # Match the contract: _generate_summary must return text with
-        # SUMMARY_PREFIX, same as the original LLM path (context_compressor.py:446).
-        _PREFIX = (
-            "[CONTEXT COMPACTION] Earlier turns in this conversation were "
-            "compacted to save context space. The summary below describes "
-            "work that was already completed, and the current session state "
-            "may still reflect that work (for example, files may already be "
-            "changed). Use the summary and the current state to continue "
-            "from where things left off, and avoid repeating work:"
-        )
-
-        def vcc_summary(turns, *args, **kwargs):
-            brief = compile_to_brief(turns)
-            if brief:
-                logger.info("VCC summary: %d chars (no LLM call)", len(brief))
-                return f"{_PREFIX}\n{brief}"
-            logger.info("VCC failed, falling back to LLM summary")
-            return original_gen(turns, *args, **kwargs)
-
-        vcc_summary._vcc_wrapped = True  # type: ignore[attr-defined]
-        compressor._generate_summary = vcc_summary
-        return True
-
-    except Exception as exc:
-        logger.warning("VCC summary hook failed: %s", exc)
         return False
